@@ -36,6 +36,10 @@ CLASSES        = ["Buah"]
 np.random.seed(42)
 COLORS = np.random.randint(0, 255, size=(max(len(CLASSES), 80), 3), dtype=np.uint8)
 
+# Streamlit Cloud tidak punya akses kamera fisik.
+# Gunakan flag ini jika deploy di server (cloud = upload image/video saja)
+IS_CLOUD = not os.path.exists("/dev/video0") and os.name != "nt"
+
 
 def find_model():
     for p in ["*.tflite", "**/*.tflite"]:
@@ -47,8 +51,9 @@ def find_model():
 
 def find_cameras(max_test=6):
     available = []
+    back = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
     for i in range(max_test):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(i, back)
         if cap.isOpened():
             ret, _ = cap.read()
             if ret:
@@ -59,6 +64,8 @@ def find_cameras(max_test=6):
 
 @st.cache_resource
 def get_cameras():
+    if IS_CLOUD:
+        return []
     return find_cameras()
 
 
@@ -72,8 +79,7 @@ def load_model(path):
 def preprocess(frame):
     img = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    return img[np.newaxis]
+    return (img.astype(np.float32) / 255.0)[np.newaxis]
 
 
 def postprocess(output, orig_h, orig_w):
@@ -96,10 +102,8 @@ def postprocess(output, orig_h, orig_w):
     boxes, confs, class_ids = boxes[mask], confs[mask], class_ids[mask]
     cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
 
-    if cx.max() <= 2.0:
-        sx, sy = float(orig_w), float(orig_h)
-    else:
-        sx, sy = orig_w / INPUT_SIZE, orig_h / INPUT_SIZE
+    sx, sy = (float(orig_w), float(orig_h)) if cx.max() <= 2.0 \
+             else (orig_w / INPUT_SIZE, orig_h / INPUT_SIZE)
 
     x1 = np.clip((cx - bw / 2) * sx, 0, orig_w - 1).astype(np.int32)
     y1 = np.clip((cy - bh / 2) * sy, 0, orig_h - 1).astype(np.int32)
@@ -137,31 +141,33 @@ def draw(frame, detections):
     return frame
 
 
+# ── Sidebar ──────────────────────────────────────────────
 with st.sidebar:
     model_path = st.text_input("Model (.tflite)", value=find_model())
 
-    with st.spinner("Scanning kamera..."):
-        cameras = get_cameras()
-
-    if cameras:
-        cam_options = {f"Kamera {i}": i for i in cameras}
-        cam_label   = st.selectbox("Pilih Kamera", list(cam_options.keys()))
-        cam_index   = cam_options[cam_label]
-        st.success(f"{len(cameras)} kamera: {cameras}")
+    if not IS_CLOUD:
+        with st.spinner("Scanning kamera..."):
+            cameras = get_cameras()
+        if cameras:
+            cam_options = {f"Kamera {i}": i for i in cameras}
+            cam_label   = st.selectbox("Pilih Kamera", list(cam_options.keys()))
+            cam_index   = cam_options[cam_label]
+            st.success(f"{len(cameras)} kamera: {cameras}")
+        else:
+            st.error("Tidak ada kamera")
+            cam_index = None
     else:
-        st.error("Tidak ada kamera")
         cam_index = None
+        st.info("☁️ Mode cloud: gunakan upload gambar/video")
 
+    mode = st.radio("Mode", ["📷 Webcam", "🖼️ Upload Gambar", "🎬 Upload Video"],
+                    index=0 if not IS_CLOUD else 1)
     stop_btn = st.button("Stop", use_container_width=True)
 
-st.markdown("Test Model Deteksi")
+st.markdown("### Deteksi Buah — YOLOv11")
 
 if not os.path.exists(model_path):
     st.error(f"Model tidak ditemukan: `{model_path}`")
-    st.stop()
-
-if cam_index is None:
-    st.warning("Tidak ada kamera tersedia.")
     st.stop()
 
 interpreter    = load_model(model_path)
@@ -177,62 +183,148 @@ def run_inference(frame):
     return interpreter.get_tensor(out_idx)
 
 
-col_vid, col_info = st.columns([3, 1])
-frame_slot = col_vid.empty()
-
-with col_info:
-    fps_slot   = st.empty()
-    count_slot = st.empty()
-    st.markdown("---")
-    det_slot   = st.empty()
-
-cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-if not cap.isOpened():
-    st.error(f"Gagal membuka kamera index {cam_index}.")
-    st.stop()
-
-last_detections = []
-frame_count     = 0
-t_prev          = time.time()
-
-while not stop_btn:
-    ret, frame = cap.read()
-    if not ret:
-        st.error("Kamera terputus.")
-        break
-
-    frame_count += 1
-
-    if frame_count % SKIP_FRAME == 0:
-        output          = run_inference(frame)
-        last_detections = postprocess(output, frame.shape[0], frame.shape[1])
-
-    draw(frame, last_detections)
-
-    now    = time.time()
-    fps    = 1 / (now - t_prev + 1e-9)
-    t_prev = now
-
-    cv2.putText(frame, f"FPS: {fps:.1f}", (6, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 80), 2)
-
-    frame_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                     channels="RGB", use_container_width=True)
-    fps_slot.metric("FPS", f"{fps:.1f}")
-    count_slot.metric("Objek", len(last_detections))
-
-    if last_detections:
+def show_det_info(col, fps, detections):
+    col.metric("FPS", f"{fps:.1f}")
+    col.metric("Objek", len(detections))
+    col.markdown("---")
+    if detections:
         lines = [
             f"**{i+1}. {CLASSES[d['class_id']] if d['class_id'] < len(CLASSES) else d['class_id']}** `{d['conf']:.2f}`"
-            for i, d in enumerate(last_detections)
+            for i, d in enumerate(detections)
         ]
-        det_slot.markdown("\n\n".join(lines))
+        col.markdown("\n\n".join(lines))
     else:
-        det_slot.markdown("_Tidak ada deteksi_")
+        col.markdown("_Tidak ada deteksi_")
 
-cap.release()
+
+# ── Mode Webcam ───────────────────────────────────────────
+if mode == "📷 Webcam":
+    if IS_CLOUD:
+        st.warning("Webcam tidak tersedia di Streamlit Cloud. Gunakan mode Upload.")
+        st.stop()
+    if cam_index is None:
+        st.warning("Tidak ada kamera tersedia.")
+        st.stop()
+
+    col_vid, col_info = st.columns([3, 1])
+    frame_slot = col_vid.empty()
+    fps_s   = col_info.empty()
+    cnt_s   = col_info.empty()
+    sep     = col_info.markdown("---")
+    det_s   = col_info.empty()
+
+    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
+    cap = cv2.VideoCapture(cam_index, backend)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        st.error(f"Gagal membuka kamera {cam_index}.")
+        st.stop()
+
+    last_det = []
+    fc       = 0
+    t_prev   = time.time()
+
+    while not stop_btn:
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Kamera terputus.")
+            break
+        fc += 1
+        if fc % SKIP_FRAME == 0:
+            last_det = postprocess(run_inference(frame), frame.shape[0], frame.shape[1])
+
+        draw(frame, last_det)
+        now  = time.time()
+        fps  = 1 / (now - t_prev + 1e-9)
+        t_prev = now
+        cv2.putText(frame, f"FPS:{fps:.1f}", (6, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 80), 2)
+
+        frame_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                         channels="RGB", use_container_width=True)
+        fps_s.metric("FPS", f"{fps:.1f}")
+        cnt_s.metric("Objek", len(last_det))
+        if last_det:
+            det_s.markdown("\n\n".join(
+                [f"**{i+1}. {CLASSES[d['class_id']] if d['class_id'] < len(CLASSES) else d['class_id']}** `{d['conf']:.2f}`"
+                 for i, d in enumerate(last_det)]))
+        else:
+            det_s.markdown("_Tidak ada deteksi_")
+
+    cap.release()
+
+# ── Mode Upload Gambar ────────────────────────────────────
+elif mode == "🖼️ Upload Gambar":
+    from PIL import Image
+    uploaded = st.file_uploader("Upload gambar", type=["jpg", "jpeg", "png"])
+    if uploaded:
+        img   = Image.open(uploaded).convert("RGB")
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        h, w  = frame.shape[:2]
+        with st.spinner("Inferensi..."):
+            t0   = time.time()
+            dets = postprocess(run_inference(frame), h, w)
+            ms   = (time.time() - t0) * 1000
+        draw(frame, dets)
+        col_vid, col_info = st.columns([3, 1])
+        col_vid.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                      use_container_width=True)
+        col_info.metric("Waktu", f"{ms:.0f} ms")
+        col_info.metric("Objek", len(dets))
+        col_info.markdown("---")
+        if dets:
+            col_info.markdown("\n\n".join(
+                [f"**{i+1}. {CLASSES[d['class_id']] if d['class_id'] < len(CLASSES) else d['class_id']}** `{d['conf']:.2f}`"
+                 for i, d in enumerate(dets)]))
+
+# ── Mode Upload Video ─────────────────────────────────────
+elif mode == "🎬 Upload Video":
+    import tempfile
+    uploaded = st.file_uploader("Upload video", type=["mp4", "avi", "mov"])
+    if uploaded:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(uploaded.read())
+        tmp.flush()
+
+        col_vid, col_info = st.columns([3, 1])
+        frame_slot = col_vid.empty()
+        fps_s      = col_info.empty()
+        cnt_s      = col_info.empty()
+        col_info.markdown("---")
+        det_s = col_info.empty()
+
+        cap    = cv2.VideoCapture(tmp.name)
+        last_det = []
+        fc     = 0
+        t_prev = time.time()
+
+        while cap.isOpened() and not stop_btn:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            fc += 1
+            if fc % SKIP_FRAME == 0:
+                last_det = postprocess(run_inference(frame), frame.shape[0], frame.shape[1])
+            draw(frame, last_det)
+            now  = time.time()
+            fps  = 1 / (now - t_prev + 1e-9)
+            t_prev = now
+            cv2.putText(frame, f"FPS:{fps:.1f}", (6, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 80), 2)
+            frame_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                             channels="RGB", use_container_width=True)
+            fps_s.metric("FPS", f"{fps:.1f}")
+            cnt_s.metric("Objek", len(last_det))
+            if last_det:
+                det_s.markdown("\n\n".join(
+                    [f"**{i+1}. {CLASSES[d['class_id']] if d['class_id'] < len(CLASSES) else d['class_id']}** `{d['conf']:.2f}`"
+                     for i, d in enumerate(last_det)]))
+            else:
+                det_s.markdown("_Tidak ada deteksi_")
+
+        cap.release()
+        os.unlink(tmp.name)
